@@ -7,6 +7,14 @@ package webdav
 import (
 	"context"
 	"fmt"
+	"mime"
+	"net"
+	"net/http"
+	"path"
+	"path/filepath"
+	"strings"
+	"time"
+
 	"github.com/Xhofe/alist/conf"
 	"github.com/Xhofe/alist/drivers/base"
 	"github.com/Xhofe/alist/drivers/operate"
@@ -14,12 +22,6 @@ import (
 	"github.com/Xhofe/alist/server/common"
 	"github.com/Xhofe/alist/utils"
 	log "github.com/sirupsen/logrus"
-	"net"
-	"net/http"
-	"path"
-	"path/filepath"
-	"strings"
-	"time"
 )
 
 type FileSystem struct{}
@@ -31,36 +33,53 @@ func (fs *FileSystem) File(rawPath string) (*model.File, error) {
 	if f, ok := upFileMap[rawPath]; ok {
 		return f, nil
 	}
-	if model.AccountsCount() > 1 && rawPath == "/" {
-		now := time.Now()
-		return &model.File{
-			Name:      "root",
-			Size:      0,
-			Type:      conf.FOLDER,
-			Driver:    "root",
-			UpdatedAt: &now,
-		}, nil
-	}
 	account, path_, driver, err := common.ParsePath(rawPath)
+	log.Debugln(account, path_, driver, err)
 	if err != nil {
+		if err.Error() == "path not found" {
+			accountFiles := model.GetAccountFilesByPath(rawPath)
+			if len(accountFiles) != 0 {
+				now := time.Now()
+				return &model.File{
+					Name:      "root",
+					Size:      0,
+					Type:      conf.FOLDER,
+					UpdatedAt: &now,
+				}, nil
+			}
+		}
 		return nil, err
 	}
-	return operate.File(driver, account, path_)
+	file, err := operate.File(driver, account, path_)
+	if err != nil && err.Error() == "path not found" {
+		accountFiles := model.GetAccountFilesByPath(rawPath)
+		if len(accountFiles) != 0 {
+			now := time.Now()
+			return &model.File{
+				Name:      "root",
+				Size:      0,
+				Type:      conf.FOLDER,
+				UpdatedAt: &now,
+			}, nil
+		}
+	}
+	return file, err
 }
 
 func (fs *FileSystem) Files(ctx context.Context, rawPath string) ([]model.File, error) {
 	rawPath = utils.ParsePath(rawPath)
-	var files []model.File
-	var err error
-	if model.AccountsCount() > 1 && rawPath == "/" {
-		files, err = model.GetAccountFiles()
-	} else {
-		account, path_, driver, err := common.ParsePath(rawPath)
-		if err != nil {
-			return nil, err
-		}
-		files, err = operate.Files(driver, account, path_)
-	}
+	//var files []model.File
+	//var err error
+	//if model.AccountsCount() > 1 && rawPath == "/" {
+	//	files, err = model.GetAccountFilesByPath("/")
+	//} else {
+	//	account, path_, driver, err := common.ParsePath(rawPath)
+	//	if err != nil {
+	//		return nil, err
+	//	}
+	//	files, err = operate.Files(driver, account, path_)
+	//}
+	_, files, _, _, _, err := common.Path(rawPath)
 	if err != nil {
 		return nil, err
 	}
@@ -116,7 +135,7 @@ func (fs *FileSystem) Link(w http.ResponseWriter, r *http.Request, rawPath strin
 		if err != nil {
 			return "", err
 		}
-		link_, err := driver.Link(base.Args{Path: path_}, account)
+		link_, err := driver.Link(base.Args{Path: path_, Header: r.Header}, account)
 		if err != nil {
 			return "", err
 		}
@@ -125,10 +144,10 @@ func (fs *FileSystem) Link(w http.ResponseWriter, r *http.Request, rawPath strin
 	}
 	if driver.Config().OnlyProxy || account.WebdavProxy {
 		link = fmt.Sprintf("%s://%s/p%s", protocol, r.Host, rawPath)
-		if conf.GetBool("check down link") {
-			sign := utils.SignWithToken(utils.Base(rawPath), conf.Token)
-			link += "?sign=" + sign
-		}
+		//if conf.GetBool("check down link") {
+		sign := utils.SignWithToken(utils.Base(rawPath), conf.Token)
+		link += "?sign=" + sign
+		//}
 	} else {
 		link_, err := driver.Link(base.Args{Path: path_, IP: ClientIP(r)}, account)
 		if err != nil {
@@ -180,8 +199,17 @@ func (fs *FileSystem) Upload(ctx context.Context, r *http.Request, rawPath strin
 	} else {
 		delete(upFileMap, rawPath)
 	}
+	mimeType := r.Header.Get("Content-Type")
+	if mimeType == "" || strings.ToLower(mimeType) == "application/octet-stream" {
+		mimeTypeTmp := mime.TypeByExtension(path.Ext(fileName))
+		if mimeTypeTmp != "" {
+			mimeType = mimeTypeTmp
+		} else {
+			mimeType = "application/octet-stream"
+		}
+	}
 	fileData := model.FileStream{
-		MIMEType:   r.Header.Get("Content-Type"),
+		MIMEType:   mimeType,
 		File:       r.Body,
 		Size:       fileSize,
 		Name:       fileName,
